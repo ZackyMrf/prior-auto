@@ -1,6 +1,54 @@
 require('dotenv').config();
 const axios = require('axios');
 const { ethers } = require('ethers');
+const fs = require('fs');
+const path = require('path');
+const HttpsProxyAgent = require('https-proxy-agent');
+
+// Proxy Manager class to handle proxy rotation
+class ProxyManager {
+  constructor(proxyFilePath) {
+    this.proxyFilePath = proxyFilePath;
+    this.proxies = [];
+    this.currentProxyIndex = 0;
+    this.loadProxies();
+  }
+
+  loadProxies() {
+    try {
+      if (fs.existsSync(this.proxyFilePath)) {
+        const proxyContent = fs.readFileSync(this.proxyFilePath, 'utf-8').trim();
+        if (proxyContent) {
+          this.proxies = proxyContent
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#'));
+          console.log(`🌐 Loaded ${this.proxies.length} proxies from ${this.proxyFilePath}`);
+        } else {
+          console.log(`⚠️ Proxy file ${this.proxyFilePath} is empty. Running without proxies.`);
+        }
+      } else {
+        console.log(`⚠️ Proxy file ${this.proxyFilePath} not found. Running without proxies.`);
+      }
+    } catch (error) {
+      console.error(`❌ Error loading proxies: ${error.message}`);
+    }
+  }
+
+  getNextProxy() {
+    if (this.proxies.length === 0) {
+      return null;
+    }
+    
+    const proxy = this.proxies[this.currentProxyIndex];
+    this.currentProxyIndex = (this.currentProxyIndex + 1) % this.proxies.length;
+    return proxy;
+  }
+
+  hasProxies() {
+    return this.proxies.length > 0;
+  }
+}
 
 // Configuration constants
 const CONFIG = {
@@ -17,6 +65,9 @@ const CONFIG = {
   }
 };
 
+// Initialize proxy manager
+const proxyManager = new ProxyManager(path.join(__dirname, 'proxy.txt'));
+
 // Enhanced HTTP client
 class ApiClient {
   constructor(baseUrl, headers) {
@@ -27,9 +78,32 @@ class ApiClient {
   async post(endpoint, data, retries = 3) {
     try {
       const url = `${this.baseUrl}${endpoint}`;
-      const response = await axios.post(url, data, { headers: this.headers });
+      
+      // Configure request options
+      const options = { headers: this.headers };
+      
+      // Add proxy if available
+      if (proxyManager.hasProxies()) {
+        const proxy = proxyManager.getNextProxy();
+        if (proxy) {
+          // Create proxy agent
+          const proxyAgent = new HttpsProxyAgent(proxy);
+          options.httpsAgent = proxyAgent;
+          
+          // Mask password in logs if it exists
+          const maskedProxy = proxy.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@');
+          console.log(`🔄 Using proxy: ${maskedProxy}`);
+        }
+      }
+      
+      const response = await axios.post(url, data, options);
       return response.data;
     } catch (error) {
+      if ((error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') && proxyManager.hasProxies() && retries > 0) {
+        console.log(`⚠️ Proxy connection failed. Trying another proxy...`);
+        return this.post(endpoint, data, retries - 1);
+      }
+      
       if (error.response?.status === 429 && retries > 0) {
         const retryAfter = error.response.data.retryAfter || 
                           (error.response.headers['retry-after'] || 2);
